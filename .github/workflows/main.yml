@@ -1,0 +1,73 @@
+name: Build Wenku8 iOS Unsigned IPA
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 60
+
+    steps:
+      - name: Download v0.5.5 source
+        run: |
+          curl -fL \
+            "https://github.com/mikufoxxx/Wenku8_Flutter/archive/refs/tags/v0.5.5.zip" \
+            -o source.zip
+          unzip source.zip -d source
+          echo "SOURCE_DIR=$PWD/source/Wenku8_Flutter-0.5.5" >> "$GITHUB_ENV"
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.41.5"
+          channel: stable
+          cache: true
+
+      - name: Check source and dependencies
+        run: |
+          cd "$SOURCE_DIR"
+          test -f pubspec.yaml
+          test -f ios/Podfile
+          flutter --version
+          flutter pub get
+
+      - name: Install iOS dependencies
+        run: |
+          cd "$SOURCE_DIR/ios"
+          pod install
+
+      - name: Build unsigned iOS app
+        run: |
+          cd "$SOURCE_DIR"
+          flutter build ios --release --no-codesign
+
+      - name: Package unsigned IPA
+        run: |
+          cd "$SOURCE_DIR"
+          APP_PATH="build/ios/iphoneos/Runner.app"
+
+          if [ ! -d "$APP_PATH" ]; then
+            echo "Runner.app not found"
+            find build/ios -maxdepth 5 -name "*.app" -print
+            exit 1
+          fi
+
+          mkdir -p "$RUNNER_TEMP/Payload"
+          cp -R "$APP_PATH" "$RUNNER_TEMP/Payload/Runner.app"
+
+          cd "$RUNNER_TEMP"
+          /usr/bin/ditto -c -k --sequesterRsrc \
+            --keepParent Payload Wenku8-0.5.5-unsigned.ipa
+
+      - name: Upload IPA
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Wenku8-iOS-0.5.5-unsigned
+          path: ${{ runner.temp }}/Wenku8-0.5.5-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 7
