@@ -40,6 +40,43 @@ jobs:
           cd "$SOURCE_DIR/ios"
           pod install
 
+           - name: Disable Xcode code signing
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          ios_dir = Path(os.environ["SOURCE_DIR"]) / "ios"
+          projects = [
+              p for p in ios_dir.rglob("project.pbxproj")
+              if "Pods" not in p.parts
+              and ".symlinks" not in p.parts
+          ]
+
+          if not projects:
+              raise SystemExit("ERROR: No Xcode project found under ios/")
+
+          for p in projects:
+              text = p.read_text()
+              marker = "buildSettings = {"
+
+              if marker not in text:
+                  print(f"Skipped: {p}")
+                  continue
+
+              settings = """buildSettings = {
+                      CODE_SIGNING_ALLOWED = NO;
+                      CODE_SIGNING_REQUIRED = NO;
+                      CODE_SIGN_IDENTITY = "";
+                      DEVELOPMENT_TEAM = "";
+                      PROVISIONING_PROFILE_SPECIFIER = "";"""
+
+              text = text.replace(marker, settings)
+              p.write_text(text)
+              print(f"Patched signing settings: {p}")
+
+          PY
+          
       - name: Build unsigned iOS app
         run: |
           cd "$SOURCE_DIR"
