@@ -1,107 +1,118 @@
 name: Build Wenku8 iOS Unsigned IPA
-
 on:
   workflow_dispatch:
-
 permissions:
   contents: read
-
 jobs:
   build:
     runs-on: macos-15
     timeout-minutes: 60
-
     steps:
       - name: Download v0.5.5 source
         run: |
+          set -euo pipefail
           curl -fL \
             "https://github.com/mikufoxxx/Wenku8_Flutter/archive/refs/tags/v0.5.5.zip" \
             -o source.zip
-          unzip source.zip -d source
-          echo "SOURCE_DIR=$PWD/source/Wenku8_Flutter-0.5.5" >> "$GITHUB_ENV"
-
+          unzip -q source.zip -d source
+          SOURCE_DIR="$(find "$PWD/source" -maxdepth 2 -type f -name pubspec.yaml -print -quit | xargs dirname)"
+          if [ -z "$SOURCE_DIR" ] || [ ! -f "$SOURCE_DIR/pubspec.yaml" ]; then
+            echo "ERROR: Could not locate pubspec.yaml"
+            find "$PWD/source" -maxdepth 4 -type f -name pubspec.yaml
+            exit 1
+          fi
+          echo "SOURCE_DIR=$SOURCE_DIR" >> "$GITHUB_ENV"
+          echo "Source directory: $SOURCE_DIR"
       - name: Set up Flutter
         uses: subosito/flutter-action@v2
         with:
-          flutter-version: "3.41.5"
           channel: stable
           cache: true
-
-      - name: Check source and dependencies
+      - name: Check Flutter and install dependencies
         run: |
+          set -euo pipefail
           cd "$SOURCE_DIR"
-          test -f pubspec.yaml
-          test -f ios/Podfile
           flutter --version
           flutter pub get
-
-      - name: Install iOS dependencies
+      - name: Install CocoaPods dependencies
         run: |
-          cd "$SOURCE_DIR/ios"
-          pod install
-
-           - name: Disable Xcode code signing
+          set -euo pipefail
+          cd "$SOURCE_DIR"
+          if [ -f ios/Podfile ]; then
+            cd ios
+            pod install
+          else
+            echo "ERROR: ios/Podfile not found"
+            exit 1
+          fi
+      - name: Disable Xcode code signing
         run: |
+          set -euo pipefail
           python3 - <<'PY'
           import os
+          import re
           from pathlib import Path
-
           ios_dir = Path(os.environ["SOURCE_DIR"]) / "ios"
           projects = [
               p for p in ios_dir.rglob("project.pbxproj")
               if "Pods" not in p.parts
               and ".symlinks" not in p.parts
           ]
-
           if not projects:
               raise SystemExit("ERROR: No Xcode project found under ios/")
-
-          for p in projects:
-              text = p.read_text()
-              marker = "buildSettings = {"
-
-              if marker not in text:
-                  print(f"Skipped: {p}")
-                  continue
-
-              settings = """buildSettings = {
+          for project in projects:
+              text = project.read_text()
+              # Add explicit unsigned-build settings to every build-settings
+              # block in the app's Xcode project.
+              settings = """
                       CODE_SIGNING_ALLOWED = NO;
                       CODE_SIGNING_REQUIRED = NO;
                       CODE_SIGN_IDENTITY = "";
                       DEVELOPMENT_TEAM = "";
-                      PROVISIONING_PROFILE_SPECIFIER = "";"""
-
-              text = text.replace(marker, settings)
-              p.write_text(text)
-              print(f"Patched signing settings: {p}")
-
+                      PROVISIONING_PROFILE_SPECIFIER = "";
+          """
+              text, count = re.subn(
+                  r"buildSettings = \{",
+                  lambda match: match.group(0) + settings,
+                  text,
+              )
+              if count == 0:
+                  print(f"WARNING: No build settings modified in {project}")
+              else:
+                  project.write_text(text)
+                  print(f"Updated {count} build-settings blocks in {project}")
           PY
-          
       - name: Build unsigned iOS app
         run: |
+          set -euo pipefail
           cd "$SOURCE_DIR"
-          flutter build ios --release --no-codesign
-
+          flutter build ios \
+            --release \
+            --no-codesign \
+            --verbose
       - name: Package unsigned IPA
         run: |
+          set -euo pipefail
           cd "$SOURCE_DIR"
           APP_PATH="build/ios/iphoneos/Runner.app"
-
           if [ ! -d "$APP_PATH" ]; then
-            echo "Runner.app not found"
-            find build/ios -maxdepth 5 -name "*.app" -print
+            echo "ERROR: Runner.app not found at $APP_PATH"
+            echo "Searching for generated .app bundles..."
+            find build/ios -type d -name "*.app" -print || true
             exit 1
           fi
-
           mkdir -p "$RUNNER_TEMP/Payload"
           cp -R "$APP_PATH" "$RUNNER_TEMP/Payload/Runner.app"
-
           cd "$RUNNER_TEMP"
           /usr/bin/ditto -c -k --sequesterRsrc \
-            --keepParent Payload Wenku8-0.5.5-unsigned.ipa
-
-      - name: Upload IPA
-        if: success()
+            --keepParent Payload \
+            Wenku8-0.5.5-unsigned.ipa
+          if [ ! -f Wenku8-0.5.5-unsigned.ipa ]; then
+            echo "ERROR: IPA packaging failed"
+            exit 1
+          fi
+          ls -lh Wenku8-0.5.5-unsigned.ipa
+      - name: Upload unsigned IPA
         uses: actions/upload-artifact@v4
         with:
           name: Wenku8-iOS-0.5.5-unsigned
