@@ -1,88 +1,123 @@
-name: Build Wenku8 iOS Unsigned IPA
+name: Build unsigned iOS IPA
 on:
   workflow_dispatch:
 permissions:
   contents: read
 jobs:
-  build:
+  build-ios:
     runs-on: macos-15
-    timeout-minutes: 60
     steps:
-      - name: Download v0.5.5 source
+      - name: Checkout workflow repository
+        uses: actions/checkout@v4
+      - name: Download Wenku8_Flutter v0.5.5
+        shell: bash
         run: |
           set -euo pipefail
-          curl -fL \
+          mkdir -p "$RUNNER_TEMP/wenku8-source"
+          curl -fL --retry 3 \
             "https://github.com/mikufoxxx/Wenku8_Flutter/archive/refs/tags/v0.5.5.zip" \
-            -o source.zip
-          unzip -q source.zip -d source
-          SOURCE_DIR="$(find "$PWD/source" -maxdepth 2 -type f -name pubspec.yaml -print -quit | xargs dirname)"
+            -o "$RUNNER_TEMP/wenku8-source/source.zip"
+          unzip -q "$RUNNER_TEMP/wenku8-source/source.zip" \
+            -d "$RUNNER_TEMP/wenku8-source"
+          SOURCE_DIR="$(find "$RUNNER_TEMP/wenku8-source" \
+            -type f -name pubspec.yaml -print -quit | xargs dirname)"
           if [ -z "$SOURCE_DIR" ] || [ ! -f "$SOURCE_DIR/pubspec.yaml" ]; then
-            echo "ERROR: Could not locate pubspec.yaml"
-            find "$PWD/source" -maxdepth 4 -type f -name pubspec.yaml
+            echo "::error::未找到 Flutter 项目的 pubspec.yaml"
             exit 1
           fi
           echo "SOURCE_DIR=$SOURCE_DIR" >> "$GITHUB_ENV"
-          echo "Source directory: $SOURCE_DIR"
-      - name: Set up Flutter
+          echo "源码目录：$SOURCE_DIR"
+          echo "源码版本信息："
+          grep -n -A 5 '^version:' "$SOURCE_DIR/pubspec.yaml" || true
+      - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
+          flutter-version: "3.41.5"
           channel: stable
-          cache: true
-      - name: Check Flutter and install dependencies
+          cache: false
+      - name: Show build environment
+        shell: bash
+        run: |
+          flutter --version
+          xcodebuild -version
+          pod --version
+      - name: Check source files and missing symbols
+        shell: bash
         run: |
           set -euo pipefail
           cd "$SOURCE_DIR"
-          flutter --version
+          echo "===== 检查关键类定义 ====="
+          grep -R -n \
+            --include='*.dart' \
+            --exclude-dir='.dart_tool' \
+            -E \
+            'class (ReadingWidgetSkinPicker|ReadingReportPage|LocalScanResult|LocalScanPage|PortableBookPreparer|PreparedBookDocument|ReadingWidgetSkin|ReaderPaperGeometry|ReaderPaperMesh|LocalImportNotice|LocalImportReport|LocalImportGroup)' \
+            lib || true
+          echo "===== 检查相关方法定义 ====="
+          grep -R -n \
+            --include='*.dart' \
+            --exclude-dir='.dart_tool' \
+            -E \
+            'openLocalBookBatch|readingGoalCaption|readingDailyGoal|importLocalDocuments|scanLocalBooks' \
+            lib || true
+          echo "===== Dart 文件数量 ====="
+          find lib -type f -name '*.dart' | wc -l
+      - name: Install Flutter dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$SOURCE_DIR"
           flutter pub get
       - name: Install CocoaPods dependencies
+        shell: bash
         run: |
           set -euo pipefail
           cd "$SOURCE_DIR"
           if [ -f ios/Podfile ]; then
             cd ios
-            pod install
+            pod install --repo-update
           else
-            echo "ERROR: ios/Podfile not found"
+            echo "没有找到 ios/Podfile"
             exit 1
           fi
-      - name: Disable Xcode code signing
+      - name: Analyze Dart source
+        shell: bash
         run: |
           set -euo pipefail
+          cd "$SOURCE_DIR"
+          flutter analyze --no-pub
+      - name: Configure unsigned iOS build
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$SOURCE_DIR"
+          PROJECT_FILE="ios/Runner.xcodeproj/project.pbxproj"
+          if [ ! -f "$PROJECT_FILE" ]; then
+            echo "::error::找不到 $PROJECT_FILE"
+            exit 1
+          fi
           python3 - <<'PY'
-          import os
-          import re
           from pathlib import Path
-          ios_dir = Path(os.environ["SOURCE_DIR"]) / "ios"
-          projects = [
-              p for p in ios_dir.rglob("project.pbxproj")
-              if "Pods" not in p.parts
-              and ".symlinks" not in p.parts
-          ]
-          if not projects:
-              raise SystemExit("ERROR: No Xcode project found under ios/")
-          for project in projects:
-              text = project.read_text()
-              # Add explicit unsigned-build settings to every build-settings
-              # block in the app's Xcode project.
-              settings = """
-                      CODE_SIGNING_ALLOWED = NO;
-                      CODE_SIGNING_REQUIRED = NO;
-                      CODE_SIGN_IDENTITY = "";
-                      DEVELOPMENT_TEAM = "";
-                      PROVISIONING_PROFILE_SPECIFIER = "";
+          import re
+          path = Path("ios/Runner.xcodeproj/project.pbxproj")
+          content = path.read_text()
+          settings = """
+              CODE_SIGNING_ALLOWED = NO;
+              CODE_SIGNING_REQUIRED = NO;
+              CODE_SIGN_IDENTITY = "";
+              DEVELOPMENT_TEAM = "";
+              PROVISIONING_PROFILE_SPECIFIER = "";
           """
-              text, count = re.subn(
-                  r"buildSettings = \{",
-                  lambda match: match.group(0) + settings,
-                  text,
-              )
-              if count == 0:
-                  print(f"WARNING: No build settings modified in {project}")
-              else:
-                  project.write_text(text)
-                  print(f"Updated {count} build-settings blocks in {project}")
+          content = re.sub(
+              r"(buildSettings\s*=\s*\{)",
+              lambda match: match.group(1) + settings,
+              content
+          )
+          path.write_text(content)
+          print("已写入未签名构建配置")
           PY
       - name: Build unsigned iOS app
+        shell: bash
         run: |
           set -euo pipefail
           cd "$SOURCE_DIR"
@@ -90,32 +125,31 @@ jobs:
             --release \
             --no-codesign \
             --verbose
-      - name: Package unsigned IPA
+      - name: Package IPA
+        shell: bash
         run: |
           set -euo pipefail
           cd "$SOURCE_DIR"
           APP_PATH="build/ios/iphoneos/Runner.app"
           if [ ! -d "$APP_PATH" ]; then
-            echo "ERROR: Runner.app not found at $APP_PATH"
-            echo "Searching for generated .app bundles..."
-            find build/ios -type d -name "*.app" -print || true
+            echo "::error::未找到 Runner.app"
+            find build/ios -maxdepth 5 -print || true
             exit 1
           fi
-          mkdir -p "$RUNNER_TEMP/Payload"
-          cp -R "$APP_PATH" "$RUNNER_TEMP/Payload/Runner.app"
-          cd "$RUNNER_TEMP"
-          /usr/bin/ditto -c -k --sequesterRsrc \
-            --keepParent Payload \
-            Wenku8-0.5.5-unsigned.ipa
-          if [ ! -f Wenku8-0.5.5-unsigned.ipa ]; then
-            echo "ERROR: IPA packaging failed"
-            exit 1
-          fi
-          ls -lh Wenku8-0.5.5-unsigned.ipa
+          PACKAGE_DIR="$RUNNER_TEMP/ipa-package"
+          mkdir -p "$PACKAGE_DIR/Payload"
+          ditto "$APP_PATH" "$PACKAGE_DIR/Payload/Runner.app"
+          (
+            cd "$PACKAGE_DIR"
+            /usr/bin/zip -qry "$GITHUB_WORKSPACE/Wenku8-unsigned.ipa" Payload
+          )
+          echo "IPA 文件已生成：Wenku8-unsigned.ipa"
+          ls -lh "$GITHUB_WORKSPACE/Wenku8-unsigned.ipa"
       - name: Upload unsigned IPA
+        if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: Wenku8-iOS-0.5.5-unsigned
-          path: ${{ runner.temp }}/Wenku8-0.5.5-unsigned.ipa
+          name: Wenku8-unsigned-IPA
+          path: Wenku8-unsigned.ipa
           if-no-files-found: error
           retention-days: 7
